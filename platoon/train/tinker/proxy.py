@@ -38,6 +38,7 @@ from tinker_cookbook.completers import TokensWithLogprobs
 from tinker_cookbook.renderers import Message as TinkerMessage
 from tinker_cookbook.renderers import Renderer, get_renderer
 from tinker_cookbook.renderers import ToolCall as TinkerToolCall
+from tinker_cookbook.renderers import ToolSpec as TinkerToolSpec
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from transformers import AutoProcessor, PreTrainedTokenizer
 
@@ -50,6 +51,11 @@ T = TypeVar("T")
 class TinkerLLMInteraction:
     obs: tinker.ModelInput
     action: TokensWithLogprobs
+    # Prompt tokens Tinker billed as prefix-cache hits, straight off the
+    # ``SampleResponse``. ``obs`` is the whole conversation resent every turn, so
+    # ``obs.length`` alone overstates what was charged; this is the discount.
+    # Defaulted so interactions built without it stay valid.
+    prompt_cache_hit_tokens: int = 0
 
 
 proxy_interactions: ContextVar[dict[str, TinkerLLMInteraction]] = ContextVar("proxy_interactions")
@@ -165,6 +171,36 @@ class TinkerLLM(CustomLLM):
         if increment_version:
             self.increment_version()
 
+    @staticmethod
+    def _canonicalize_tool_call(raw: Any) -> TinkerToolCall:
+        """One LiteLLM/OpenAI tool call -> the renderer's ``ToolCall`` model.
+
+        LiteLLM carries tool calls as OpenAI wire dicts, but renderers reach into
+        them by attribute (``tc.function.name``), so a dict reaches the renderer as
+        an ``AttributeError`` rather than a useful message. ``ToolCall`` is
+        ``extra="forbid"``, so this builds the model field by field instead of
+        validating the dict: LiteLLM adds keys such as ``index`` that would
+        otherwise be rejected.
+        """
+        if isinstance(raw, TinkerToolCall):
+            return raw
+        function = raw.get("function") if isinstance(raw, dict) else getattr(raw, "function", None)
+        if function is None:
+            raise ValueError(f"Tool call has no function body: {raw!r}")
+        if isinstance(function, dict):
+            name, arguments = function.get("name"), function.get("arguments")
+        else:
+            name, arguments = getattr(function, "name", None), getattr(function, "arguments", None)
+        if not name:
+            raise ValueError(f"Tool call has no function name: {raw!r}")
+        call_id = raw.get("id") if isinstance(raw, dict) else getattr(raw, "id", None)
+        return TinkerToolCall(
+            id=call_id,
+            # The renderers emit this verbatim into the prompt and tools parse it as
+            # JSON, so an absent argument list has to be an empty object.
+            function=TinkerToolCall.FunctionBody(name=str(name), arguments=str(arguments or "{}")),
+        )
+
     def _canonicalize_messages(self, messages: Any) -> List[TinkerMessage]:
         # Note: We avoid using TypeAdapter for strict validation because TinkerMessage
         # contains ImagePart which has PIL.Image.Image that Pydantic can't handle.
@@ -172,7 +208,32 @@ class TinkerLLM(CustomLLM):
         # the correct format (coming from LiteLLM or manually constructed).
         if not isinstance(messages, list):
             raise ValueError(f"Expected list of messages, got {type(messages)}")
-        return cast(List[TinkerMessage], messages)
+        # Two fields the cast cannot cover, both on assistant turns that call tools:
+        #
+        # ``tool_calls`` -- renderers read these by attribute, so LiteLLM's OpenAI
+        #   wire dicts have to become real models first.
+        # ``content`` -- renderers index it unconditionally, but LiteLLM builds the
+        #   message with ``model_dump(exclude_none=True)``, so a turn that is only a
+        #   tool call arrives with no ``content`` key at all.
+        #
+        # Rebuild only the messages that need it, leaving every other one identical.
+        canonical: list[Any] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                canonical.append(message)
+                continue
+            tool_calls = message.get("tool_calls")
+            needs_content = message.get("role") == "assistant" and "content" not in message
+            if not tool_calls and not needs_content:
+                canonical.append(message)
+                continue
+            rebuilt = dict(message)
+            if tool_calls:
+                rebuilt["tool_calls"] = [self._canonicalize_tool_call(tc) for tc in tool_calls]
+            if needs_content:
+                rebuilt["content"] = ""
+            canonical.append(rebuilt)
+        return cast(List[TinkerMessage], canonical)
 
     def _validate_role(self, role: str) -> TypeGuard[Literal["assistant", "user", "system", "tool", "function"]]:
         if role not in ["assistant", "user", "system", "tool", "function"]:
@@ -242,12 +303,83 @@ class TinkerLLM(CustomLLM):
                 return value
         return default_value
 
+    @staticmethod
+    def _canonicalize_tool_specs(tools: Any) -> list[TinkerToolSpec]:
+        """LiteLLM's ``tools`` -> the renderer's flat ``ToolSpec`` list.
+
+        LiteLLM passes OpenAI's nested envelope, ``{"type": "function", "function":
+        {...}}``, while ``ToolSpec`` is flat, so the body has to be lifted out. A
+        spec that is already flat is taken as-is.
+        """
+        specs: list[TinkerToolSpec] = []
+        for tool in tools or []:
+            body = tool.get("function", tool) if isinstance(tool, dict) else None
+            if not isinstance(body, dict) or not body.get("name"):
+                raise ValueError(f"Tool spec has no function name: {tool!r}")
+            specs.append(
+                cast(
+                    TinkerToolSpec,
+                    {
+                        "name": body["name"],
+                        "description": body.get("description", ""),
+                        "parameters": body.get("parameters", {}),
+                    },
+                )
+            )
+        return specs
+
     def _prepare_model_input(self, **kwargs: Any) -> ModelInput:
         """LiteLLM messages -> Tinker ModelInput."""
         messages = kwargs.pop("messages", None)
         canonical_messages = self._canonicalize_messages(messages)
-        # TODO: Needs to be updated for latest tinker cookbook version.
+        # LiteLLM routes request options into ``optional_params`` rather than
+        # leaving them top level, which is why the sampling knobs below are read
+        # through ``_get_optional_params``. ``tools`` arrives the same way; the
+        # top-level lookup only covers a handler invoked directly.
+        optional_params = kwargs.get("optional_params")
+        tools = kwargs.get("tools")
+        if tools is None and isinstance(optional_params, dict):
+            tools = optional_params.get("tools")
+        specs = self._canonicalize_tool_specs(tools)
+        if specs:
+            canonical_messages = self._prepend_tool_prefix(canonical_messages, specs)
         return self.renderer.build_generation_prompt(canonical_messages)
+
+    def _prepend_tool_prefix(
+        self, messages: List[TinkerMessage], specs: list[TinkerToolSpec]
+    ) -> List[TinkerMessage]:
+        """Put the renderer's tool-definition prefix at the front of a conversation.
+
+        ``build_generation_prompt`` takes no ``tools`` argument: a renderer declares
+        tools by way of ``create_conversation_prefix_with_tools``, which folds the
+        system prompt and the tool schemas into whatever messages that format needs
+        (for Harmony, a routing system message plus a developer message carrying the
+        ``functions`` namespace). Without this the schemas never reach the model and
+        it has to guess every signature.
+
+        The prefix *absorbs* the system prompt rather than sitting beside it, so the
+        leading system message is handed over and dropped from the tail.
+        """
+        head, tail = messages, []
+        system_prompt = ""
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            system_prompt = self._normalize_message_content(messages[0].get("content"))
+            tail = list(messages[1:])
+        else:
+            tail = list(messages)
+        del head
+        try:
+            prefix = self.renderer.create_conversation_prefix_with_tools(specs, system_prompt)
+        except NotImplementedError:
+            # This renderer has no tool format. Leave the conversation untouched so
+            # behaviour matches a plain text model rather than failing the request.
+            logger.warning(
+                "Renderer %s does not support tool definitions; %s tool(s) omitted from the prompt",
+                type(self.renderer).__name__,
+                len(specs),
+            )
+            return messages
+        return cast(List[TinkerMessage], list(prefix) + tail)
 
     def _parse_response(self, model_input: ModelInput, response: SampleResponse) -> ModelResponse:
         """Tinker Response -> LiteLLM Response.
@@ -330,7 +462,12 @@ class TinkerLLM(CustomLLM):
             ),
         )
 
-    def _record_interaction(self, model_input: ModelInput, model_response: ModelResponse) -> None:
+    def _record_interaction(
+        self,
+        model_input: ModelInput,
+        model_response: ModelResponse,
+        response: SampleResponse | None = None,
+    ) -> None:
         assert len(model_response.choices) == 1
 
         logprobs_content = model_response.choices[0].logprobs.content
@@ -340,6 +477,9 @@ class TinkerLLM(CustomLLM):
                 tokens=model_response.choices[0].token_ids,
                 maybe_logprobs=[c.logprob for c in logprobs_content] if logprobs_content else [],
             ),
+            # Taken from the raw response rather than routed through the LiteLLM
+            # ``Usage``, whose other fields this proxy computes itself anyway.
+            prompt_cache_hit_tokens=int(getattr(response, "prompt_cache_hit_tokens", 0) or 0),
         )
         proxy_interactions.get()[model_response.id] = interaction
 
@@ -401,7 +541,7 @@ class TinkerLLM(CustomLLM):
         if elapsed > 30.0:
             logger.warning(f"sample_async took {elapsed:.1f}s (slow)")
         final_response = self._parse_response(model_input, result)
-        self._record_interaction(model_input, final_response)
+        self._record_interaction(model_input, final_response, result)
         return final_response
 
     def completion(self, **kwargs: Any) -> ModelResponse:  # type: ignore
@@ -430,7 +570,7 @@ class TinkerLLM(CustomLLM):
         )
         result = self.sampling_client.sample(prompt=model_input, sampling_params=params, num_samples=1)
         final_response = self._parse_response(model_input, result)
-        self._record_interaction(model_input, final_response)
+        self._record_interaction(model_input, final_response, result)
         return final_response
 
     def as_model_list(self) -> list[dict]:

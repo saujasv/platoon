@@ -85,11 +85,18 @@ def _workload_from_raw_rollout(
     # excludes, interrupts, or fails to convert one of its trajectories.
     input_tokens = sum(int(interaction.obs.length) for interaction in interactions.values())
     output_tokens = sum(len(interaction.action.tokens) for interaction in interactions.values())
+    # Reported by the provider per call, so it stays right even where consecutive
+    # prompts are not simple prefix extensions of one another.
+    cached_input_tokens = sum(
+        int(getattr(interaction, "prompt_cache_hit_tokens", 0) or 0)
+        for interaction in interactions.values()
+    )
     return RolloutWorkload(
         environment_steps=environment_steps,
         model_calls=len(interactions),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
         trajectories=trajectories,
     )
 

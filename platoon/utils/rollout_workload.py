@@ -21,6 +21,10 @@ class RolloutWorkload:
     model_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Subset of ``input_tokens`` the provider billed as prefix-cache hits. A
+    # multi-turn agent resends the whole conversation every step, so this is what
+    # separates prefill actually computed from prefill merely resent.
+    cached_input_tokens: int = 0
     trajectories: int = 0
     postmerge_datums: int = 0
     policy_eligible_datums: int = 0
@@ -32,6 +36,7 @@ class RolloutWorkload:
             "model_calls",
             "input_tokens",
             "output_tokens",
+            "cached_input_tokens",
             "trajectories",
             "postmerge_datums",
             "policy_eligible_datums",
@@ -49,6 +54,11 @@ class RolloutWorkload:
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def uncached_input_tokens(self) -> int:
+        """Prefill actually computed, i.e. charged at the full prompt rate."""
+        return max(self.input_tokens - self.cached_input_tokens, 0)
 
     @property
     def policy_excluded_datums(self) -> int:
@@ -74,6 +84,7 @@ class RolloutWorkload:
             model_calls=self.model_calls + other.model_calls,
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
+            cached_input_tokens=self.cached_input_tokens + other.cached_input_tokens,
             trajectories=self.trajectories + other.trajectories,
             postmerge_datums=self.postmerge_datums + other.postmerge_datums,
             policy_eligible_datums=self.policy_eligible_datums + other.policy_eligible_datums,
@@ -87,6 +98,8 @@ class RolloutWorkload:
             f"{prefix}/total_model_calls": float(self.model_calls),
             f"{prefix}/total_input_tokens": float(self.input_tokens),
             f"{prefix}/total_output_tokens": float(self.output_tokens),
+            f"{prefix}/total_cached_input_tokens": float(self.cached_input_tokens),
+            f"{prefix}/total_uncached_input_tokens": float(self.uncached_input_tokens),
             f"{prefix}/total_tokens": float(self.total_tokens),
             f"{prefix}/total_trajectories": float(self.trajectories),
             f"{prefix}/total_postmerge_datums": float(self.postmerge_datums),
