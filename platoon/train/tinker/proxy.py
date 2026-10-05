@@ -42,6 +42,9 @@ from tinker_cookbook.renderers import ToolSpec as TinkerToolSpec
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from transformers import AutoProcessor, PreTrainedTokenizer
 
+# Registers platoon's renderer names with get_renderer.
+import platoon.train.tinker.renderers  # noqa: F401, E402
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -208,13 +211,16 @@ class TinkerLLM(CustomLLM):
         # the correct format (coming from LiteLLM or manually constructed).
         if not isinstance(messages, list):
             raise ValueError(f"Expected list of messages, got {type(messages)}")
-        # Two fields the cast cannot cover, both on assistant turns that call tools:
+        # Three fields the cast cannot cover, all on assistant turns:
         #
         # ``tool_calls`` -- renderers read these by attribute, so LiteLLM's OpenAI
         #   wire dicts have to become real models first.
         # ``content`` -- renderers index it unconditionally, but LiteLLM builds the
         #   message with ``model_dump(exclude_none=True)``, so a turn that is only a
         #   tool call arrives with no ``content`` key at all.
+        # ``reasoning_content`` -- where ``_parse_response`` put the turn's thinking.
+        #   It goes back in as a leading ``ThinkingPart`` so the renderer formats it
+        #   in its own syntax, or drops it under ``strip_thinking_from_history``.
         #
         # Rebuild only the messages that need it, leaving every other one identical.
         canonical: list[Any] = []
@@ -224,7 +230,8 @@ class TinkerLLM(CustomLLM):
                 continue
             tool_calls = message.get("tool_calls")
             needs_content = message.get("role") == "assistant" and "content" not in message
-            if not tool_calls and not needs_content:
+            has_reasoning = "reasoning_content" in message
+            if not tool_calls and not needs_content and not has_reasoning:
                 canonical.append(message)
                 continue
             rebuilt = dict(message)
@@ -232,8 +239,26 @@ class TinkerLLM(CustomLLM):
                 rebuilt["tool_calls"] = [self._canonicalize_tool_call(tc) for tc in tool_calls]
             if needs_content:
                 rebuilt["content"] = ""
+            if has_reasoning:
+                reasoning = rebuilt.pop("reasoning_content")
+                if reasoning is not None and rebuilt.get("role") == "assistant":
+                    rebuilt["content"] = self._with_thinking_part(str(reasoning), rebuilt["content"])
             canonical.append(rebuilt)
         return cast(List[TinkerMessage], canonical)
+
+    @staticmethod
+    def _with_thinking_part(reasoning: str, content: Any) -> list[Any]:
+        """Prepend ``reasoning`` to ``content`` as a ``ThinkingPart``.
+
+        The inverse of ``_split_reasoning``: thinking first, then the text exactly as
+        it was, so a parsed turn renders back to the text it was parsed from.
+        """
+        parts: list[Any] = [{"type": "thinking", "thinking": reasoning}]
+        if isinstance(content, list):
+            parts.extend(content)
+        elif content:
+            parts.append({"type": "text", "text": str(content)})
+        return parts
 
     def _validate_role(self, role: str) -> TypeGuard[Literal["assistant", "user", "system", "tool", "function"]]:
         if role not in ["assistant", "user", "system", "tool", "function"]:
@@ -273,6 +298,22 @@ class TinkerLLM(CustomLLM):
                     parts.append(str(part))
             return "".join(parts)
         return str(content)
+
+    def _split_reasoning(self, content: Any) -> tuple[str, str | None]:
+        """Parsed response content -> (``content``, ``reasoning_content``) for LiteLLM.
+
+        Only a thinking part that opens the turn is lifted out, since
+        ``_with_thinking_part`` puts exactly one back at the start. Any later thinking
+        stays inline in ``content`` so the order of the turn is never changed.
+        ``reasoning_content`` is None when the turn does not open with thinking, and
+        ``""`` for an empty think block, which the renderer still emits.
+        """
+        if not isinstance(content, list) or not content:
+            return self._normalize_message_content(content), None
+        first = content[0]
+        if not isinstance(first, dict) or first.get("type") != "thinking":
+            return self._normalize_message_content(content), None
+        return self._normalize_message_content(content[1:]), str(first.get("thinking", ""))
 
     def _get_optional_params(
         self,
@@ -416,20 +457,28 @@ class TinkerLLM(CustomLLM):
                 if not self._validate_role(role):
                     assert False, "This should never happen"
                 # FIXME: The content should not be still there if tool call has been parsed.
-                content = self._normalize_message_content(parsed_response["content"])
+                # Thinking travels in ``reasoning_content`` rather than flattened into
+                # ``content``; agents echo the message back, and ``_canonicalize_messages``
+                # turns it back into a ThinkingPart so history re-renders as sampled.
+                content, reasoning_content = self._split_reasoning(parsed_response["content"])
                 # NOTE(yuge): I thought about adding this to make it more robust to empty responses,
                 # but later I found it's a configuration error in my renderer. So I think it's better
                 # to just log a warning and go with the default path.
                 # if not content:
                 #     raise ValueError("Parsed content is empty. Original response: " + str(response))
-                if not content:
+                if not content and not reasoning_content:
                     logger.warning("Parsed content is empty. Original response: " + str(response))
                 tool_calls = parsed_response.get("tool_calls", None)
                 if tool_calls:
                     tool_calls = [self._parse_tool_call(tool_call) for tool_call in tool_calls]
                 choices.append(
                     Choices(
-                        message=LitellmMessage(role=role, content=content, tool_calls=tool_calls),
+                        message=LitellmMessage(
+                            role=role,
+                            content=content,
+                            reasoning_content=reasoning_content,
+                            tool_calls=tool_calls,
+                        ),
                         finish_reason=seq.stop_reason,
                         logprobs=logprobs,
                         token_ids=seq.tokens,
@@ -438,11 +487,13 @@ class TinkerLLM(CustomLLM):
             else:
                 # logger.warning(f"Failed to parse response: {parsed_response}")
                 # Go with the default path
+                content, reasoning_content = self._split_reasoning(parsed_response["content"])
                 choices.append(
                     Choices(
                         message=LitellmMessage(
                             role="assistant",
-                            content=self._normalize_message_content(parsed_response["content"]),
+                            content=content,
+                            reasoning_content=reasoning_content,
                         ),
                         finish_reason=seq.stop_reason,
                         logprobs=logprobs,
