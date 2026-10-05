@@ -283,8 +283,9 @@ def make_datum_from_accumulator(
                 "error-action mask/token alignment mismatch: "
                 f"tokens={len(accumulator.full_sequence)}, mask={len(accumulator.error_action_mask)}"
             )
+        # TensorData carries only float32/int64; the consumer reads it back with .bool().
         loss_fn_inputs[ERROR_ACTION_MASK_KEY] = TensorData.from_torch(
-            torch.tensor(accumulator.error_action_mask[1:], dtype=torch.bool)
+            torch.tensor(accumulator.error_action_mask[1:], dtype=torch.long)
         )
     if traj_depth is not None:
         loss_fn_inputs["traj_depth"] = TensorData.from_torch(torch.tensor([traj_depth], dtype=torch.long))
