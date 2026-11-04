@@ -51,10 +51,11 @@ class ScriptedSamplingClient:
 
 
 def _make_llm(
-    tokenizer: Any, completions: list[str], *, strip_thinking: bool, renderer_name: str = "qwen3"
+    tokenizer: Any, completions: list[str], *, strip_thinking: bool | None, renderer_name: str = "qwen3"
 ) -> TinkerLLM:
     renderer = get_renderer(renderer_name, tokenizer)
-    renderer.strip_thinking_from_history = strip_thinking
+    if strip_thinking is not None:
+        renderer.strip_thinking_from_history = strip_thinking
     return TinkerLLM(
         model_name=MODEL_NAME,
         renderer=renderer,
@@ -196,6 +197,85 @@ def test_custom_renderer_re_renders_tool_call_turns(
     tokenizer: Any, register_provider: Any, before_call: str
 ) -> None:
     _check_tool_call_turn_re_renders(tokenizer, register_provider, "qwen3_custom", before_call)
+
+
+QWEN3_5_MODEL_NAME = "Qwen/Qwen3.5-4B"
+CRAFT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "craft",
+            "description": "Craft an item.",
+            "parameters": {"type": "object", "properties": {"item": {"type": "string"}}},
+        },
+    }
+]
+
+
+@pytest.fixture(scope="module")
+def qwen3_5_tokenizer() -> Any:
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(QWEN3_5_MODEL_NAME, local_files_only=True)
+    except OSError:
+        pytest.skip(f"{QWEN3_5_MODEL_NAME} tokenizer is not cached locally")
+
+
+def _qwen3_5_call(item: str) -> str:
+    return f"<tool_call>\n<function=craft>\n<parameter=item>\n{item}\n</parameter>\n</function>\n</tool_call>"
+
+
+def _qwen3_5_tool_turn_interactions(
+    tokenizer: Any, register_provider: Any, renderer_name: str, items: list[str]
+) -> list[Any]:
+    """A thinking tool-call turn, its tool results, then a closing turn.
+
+    Completions start inside the think block: Qwen3.5's generation prompt ends in
+    ``<think>\\n``, so the sampled tokens are the thinking, ``</think>``, then the calls.
+    """
+    completions = [
+        "Use the craft tool.\n</think>\n\n" + "\n".join(_qwen3_5_call(item) for item in items) + "<|im_end|>",
+        "It worked.\n</think>\n\nCrafted.<|im_end|>",
+    ]
+    llm = register_provider(_make_llm(tokenizer, completions, strip_thinking=None, renderer_name=renderer_name))
+    return asyncio.run(_run_tool_turn(llm, len(items)))
+
+
+async def _run_tool_turn(llm: TinkerLLM, num_calls: int) -> list[Any]:
+    """Like ``_run_conversation``, but answers the first turn with one result per tool call."""
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "You craft items."},
+        {"role": "user", "content": "Craft a wooden plank."},
+    ]
+    async with TinkerLLMProxySession() as session:
+        first = await litellm.acompletion(model=LITELLM_MODEL, messages=messages, api_key="unused", tools=CRAFT_TOOLS)
+        reply = first.choices[0].message.model_dump(exclude_none=True)
+        assert [call["function"]["name"] for call in reply["tool_calls"]] == ["craft"] * num_calls
+        results = [{"role": "tool", "tool_call_id": call["id"], "content": "ok"} for call in reply["tool_calls"]]
+        await litellm.acompletion(
+            model=LITELLM_MODEL, messages=[*messages, reply, *results], api_key="unused", tools=CRAFT_TOOLS
+        )
+        return list(session.interactions.values())
+
+
+@pytest.mark.parametrize("items", [["planks"], ["planks", "sticks"]], ids=["one_call", "parallel_calls"])
+def test_qwen3_5_custom_renderer_re_renders_tool_call_turns(
+    qwen3_5_tokenizer: Any, register_provider: Any, items: list[str]
+) -> None:
+    interactions = _qwen3_5_tool_turn_interactions(qwen3_5_tokenizer, register_provider, "qwen3_5_custom", items)
+    assert len(interactions) == 2
+    _assert_each_turn_extends_the_last(interactions)
+
+
+@pytest.mark.parametrize("items", [["planks"], ["planks", "sticks"]], ids=["one_call", "parallel_calls"])
+def test_qwen3_5_renderer_breaks_tool_call_turns(
+    qwen3_5_tokenizer: Any, register_provider: Any, items: list[str]
+) -> None:
+    """Stock ``qwen3_5`` (thinking stripped from history by default) cannot extend."""
+    interactions = _qwen3_5_tool_turn_interactions(qwen3_5_tokenizer, register_provider, "qwen3_5", items)
+    with pytest.raises(AssertionError):
+        _assert_each_turn_extends_the_last(interactions)
 
 
 def test_strip_thinking_from_history_still_drops_it(tokenizer: Any, register_provider: Any) -> None:

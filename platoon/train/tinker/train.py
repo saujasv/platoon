@@ -38,6 +38,7 @@ async def arun_tinker_training(args: list[str] | None = None, default_config_pat
     get_task_fn = AutoTaskLoader.from_config(config)
     reward_processor = AutoRewardProcessor.from_config(config)
     workflow_cls = AutoWorkflow.from_config(config, default=GroupRolloutWorkflow)
+    eval_workflow_cls = AutoWorkflow.from_config(config, default=GroupRolloutWorkflow, split="eval")
 
     trainer = PlatoonTinkerRLTrainer(config=config, train_dataset=train_dataset, eval_dataset=eval_dataset)
     async with trainer:
@@ -55,7 +56,7 @@ async def arun_tinker_training(args: list[str] | None = None, default_config_pat
         )
 
         eval_workflow_kwargs = dict(environment.eval_workflow_kwargs)
-        eval_workflow = workflow_cls(
+        eval_workflow = eval_workflow_cls(
             rollout_fn=eval_rollout_fn,
             get_task_fn=get_task_fn,
             config=config.eval.workflow_config,

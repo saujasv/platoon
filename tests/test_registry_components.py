@@ -104,6 +104,36 @@ def test_auto_workflow_uses_default_group_rollout_name():
 
     config = type("Config", (), {"environments": [EnvironmentConfig(workflow="group_rollout")]})()
     assert AutoWorkflow.from_config(config, default=DefaultWorkflow) is DefaultWorkflow
+    assert AutoWorkflow.from_config(config, default=DefaultWorkflow, split="eval") is DefaultWorkflow
+
+
+def test_auto_workflow_eval_split_resolves_eval_workflow():
+    class DefaultWorkflow:
+        pass
+
+    class EvalWorkflow:
+        pass
+
+    workflow_registry = Registry("workflow")
+    workflow_registry.register("fake/eval", EvalWorkflow)
+
+    from platoon import registry as registry_module
+
+    original = registry_module._REGISTRIES.get("workflow")
+    registry_module._REGISTRIES["workflow"] = workflow_registry
+    try:
+        config = type(
+            "Config",
+            (),
+            {"environments": [EnvironmentConfig(workflow="group_rollout", eval_workflow="fake/eval")]},
+        )()
+        assert AutoWorkflow.from_config(config, default=DefaultWorkflow) is DefaultWorkflow
+        assert AutoWorkflow.from_config(config, default=DefaultWorkflow, split="eval") is EvalWorkflow
+    finally:
+        if original is None:
+            registry_module._REGISTRIES.pop("workflow", None)
+        else:
+            registry_module._REGISTRIES["workflow"] = original
 
 
 def test_auto_environment_rejects_multiple_environments():

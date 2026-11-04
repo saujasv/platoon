@@ -50,6 +50,7 @@ class EnvironmentConfig:
     eval_rollout: str | None = None
     reward_processor: str | None = None
     workflow: str = "group_rollout"
+    eval_workflow: str | None = None
     dataset_kwargs: dict[str, Any] = field(default_factory=dict)
     eval_dataset_kwargs: dict[str, Any] = field(default_factory=dict)
     workflow_kwargs: dict[str, Any] = field(default_factory=dict)

@@ -102,8 +102,13 @@ class AutoWorkflow:
     """Resolve a workflow class from environment config."""
 
     @classmethod
-    def from_config(cls, config: Any, default: type) -> type:
+    def from_config(cls, config: Any, default: type, split: str = "train") -> type:
         environment = AutoEnvironment.from_config(config)
-        if environment.workflow == "group_rollout":
+        workflow_spec = (
+            environment.workflow
+            if split == "train"
+            else environment.eval_workflow or environment.workflow
+        )
+        if workflow_spec == "group_rollout":
             return default
-        return resolve_component("workflow", environment.workflow)
+        return resolve_component("workflow", workflow_spec)
