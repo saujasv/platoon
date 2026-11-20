@@ -72,6 +72,9 @@ class TrainConfig:
     loss_fn: str = "cispo"
     loss_fn_config: dict = field(default_factory=lambda: {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0})
     lora_rank: int = 32
+    # Seconds to wait for one microbatch's forward_backward result before treating the server as
+    # hung. A 32k-token microbatch on a LoRA server can legitimately take longer than 15 min.
+    forward_backward_timeout_seconds: float = 900.0
     workflow_config: WorkflowConfig = field(default_factory=WorkflowConfig)
     num_concurrent_rollout_workflow_workers: int | None = None
 

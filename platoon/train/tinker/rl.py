@@ -807,13 +807,13 @@ class PlatoonTinkerRLTrainer:
                     logger.debug(f"Waiting for forward_backward result (microbatch {microbatch_num})")
                     try:
                         # Use a wrapper to log periodic "still waiting" messages
-                        # Timeout after 15 min to detect hung Tinker operations
+                        # Time out (train.forward_backward_timeout_seconds) to detect hung Tinker operations
                         forward_backward_result = await self._await_with_heartbeat(
                             forward_backward_future.result_async(),
                             name=f"forward_backward (microbatch {microbatch_num})",
                             heartbeat_interval=60.0,
                             watchdog=shared_state.watchdog,
-                            total_timeout=900.0,
+                            total_timeout=self.config.train.forward_backward_timeout_seconds,
                         )
                     except Exception as e:
                         logger.exception(
